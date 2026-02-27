@@ -27,14 +27,14 @@ from openpyxl.utils import get_column_letter
 # ══════════════════════════════════════════════
 import os
 
-ODOO_URL      = os.environ.get("ODOO_URL",      "https://tu-odoo.temponovo.cl")
-ODOO_DB       = os.environ.get("ODOO_DB",       "temponovo")
-ODOO_USER     = os.environ.get("ODOO_USER",     "usuario@temponovo.cl")
+ODOO_URL      = os.environ.get("ODOO_URL", "")
+ODOO_DB       = os.environ.get("ODOO_DB", "temponovo")
+ODOO_USER     = os.environ.get("ODOO_USER", "")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")
 
-SMTP_HOST     = "smtp.gmail.com"
-SMTP_PORT     = 587
-SMTP_USER     = os.environ.get("SMTP_USER",     "reportes@temponovo.cl")
+SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER     = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
 DESTINATARIOS = [
@@ -55,6 +55,11 @@ DIAS_SIN_OUT    = 3      # días con PICK pero sin TN/OUT realizado
 # CONEXIÓN ODOO
 # ══════════════════════════════════════════════
 def conectar_odoo():
+    print(f"  DEBUG URL: '{ODOO_URL}'")
+    print(f"  DEBUG DB:  '{ODOO_DB}'")
+    print(f"  DEBUG USER:'{ODOO_USER}'")
+    if not ODOO_URL or not ODOO_URL.startswith("http"):
+        raise Exception(f"ODOO_URL invalida o vacia: '{ODOO_URL}'. Verifica el secret ODOO_URL en GitHub.")
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:

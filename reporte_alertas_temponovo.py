@@ -27,14 +27,14 @@ from openpyxl.utils import get_column_letter
 # ══════════════════════════════════════════════
 import os
 
-ODOO_URL      = os.environ.get("ODOO_URL",      "https://tu-odoo.temponovo.cl")
-ODOO_DB       = os.environ.get("ODOO_DB",       "temponovo")
-ODOO_USER     = os.environ.get("ODOO_USER",     "usuario@temponovo.cl")
+ODOO_URL      = os.environ.get("ODOO_URL", "")
+ODOO_DB       = os.environ.get("ODOO_DB", "temponovo")
+ODOO_USER     = os.environ.get("ODOO_USER", "")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")
 
-SMTP_HOST     = "smtp.gmail.com"
-SMTP_PORT     = 587
-SMTP_USER     = os.environ.get("SMTP_USER",     "reportes@temponovo.cl")
+SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER     = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
 DESTINATARIOS = [

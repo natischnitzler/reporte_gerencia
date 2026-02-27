@@ -55,11 +55,6 @@ DIAS_SIN_OUT    = 3      # días con PICK pero sin TN/OUT realizado
 # CONEXIÓN ODOO
 # ══════════════════════════════════════════════
 def conectar_odoo():
-    print(f"  DEBUG URL: '{ODOO_URL}'")
-    print(f"  DEBUG DB:  '{ODOO_DB}'")
-    print(f"  DEBUG USER:'{ODOO_USER}'")
-    if not ODOO_URL or not ODOO_URL.startswith("http"):
-        raise Exception(f"ODOO_URL invalida o vacia: '{ODOO_URL}'. Verifica el secret ODOO_URL en GitHub.")
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:
@@ -100,7 +95,7 @@ def get_descuentos(models, uid):
             ['discount', '>', DESC_AMARILLO],
             ['move_id.move_type', '=', 'out_invoice'],
             ['move_id.state', '=', 'posted'],
-            ['exclude_from_invoice_tab', '=', False],
+            ['display_type', '=', 'product'],
         ],
         ['move_id', 'partner_id', 'product_id', 'discount', 'price_unit', 'quantity', 'price_subtotal']
     )

@@ -1,13 +1,13 @@
 """
 Reporte Automático de Alertas - Temponovo
 Envío: Lunes y jueves
-Contenido: Descuentos altos | Cobranza vencida | Pedidos atrasados
-Formato: Email HTML + 3 Excel adjuntos
+Adjuntos: Excel descuentos + PDF cobranza
 """
 
 import xmlrpc.client
 import smtplib
 import ssl
+import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -17,22 +17,21 @@ import io
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # ══════════════════════════════════════════════
 # CONFIGURACIÓN
-# Las credenciales se leen desde variables de entorno (GitHub Secrets)
-# Para pruebas locales puedes setearlas en tu terminal:
-#   export ODOO_URL="https://tu-odoo.temponovo.cl"
-#   export ODOO_PASSWORD="mi_clave"  etc.
 # ══════════════════════════════════════════════
-import os
-
 ODOO_URL      = os.environ.get("ODOO_URL", "")
 ODOO_DB       = os.environ.get("ODOO_DB", "temponovo")
 ODOO_USER     = os.environ.get("ODOO_USER", "")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")
 
-SMTP_HOST     = os.environ.get("SMTP_HOST",  "srv10.akkuarios.com")
+SMTP_HOST     = os.environ.get("SMTP_HOST", "srv10.akkuarios.com")
 SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER     = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
@@ -43,12 +42,13 @@ DESTINATARIOS = [
 ]
 
 # ── Umbrales ──
-DESC_AMARILLO   = 30.0   # % → alerta amarilla
-DESC_ROJO       = 50.0   # % → alerta roja
-COBR_DIAS       = 30     # días vencido mínimo para cobranza
-DIAS_COTIZACION = 3      # días en cotización sin confirmar
-DIAS_SIN_PICK   = 3      # días confirmado sin TN/PICK realizado
-DIAS_SIN_OUT    = 3      # días con PICK pero sin TN/OUT realizado
+DESC_AMARILLO   = 30.0
+DESC_ROJO       = 50.0
+DESC_DIAS       = 3
+COBR_DIAS       = 30
+DIAS_COTIZACION = 3
+DIAS_SIN_PICK   = 3
+DIAS_SIN_OUT    = 3
 
 
 # ══════════════════════════════════════════════
@@ -58,7 +58,7 @@ def conectar_odoo():
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:
-        raise Exception("Autenticación fallida. Verifica credenciales Odoo.")
+        raise Exception("Autenticación fallida.")
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
 
@@ -72,19 +72,18 @@ def buscar(models, uid, modelo, dominio, campos, limite=1000):
 
 
 # ══════════════════════════════════════════════
-# 1. DESCUENTOS > 30%
+# 1. DESCUENTOS > 30% — últimos 3 días
 # ══════════════════════════════════════════════
 def get_descuentos(models, uid):
-    """
-    Líneas de pedidos confirmados y facturas con descuento > 30%.
-    Resumen email: Cliente | N° Pedido | % Descuento
-    Excel detalle: + Código | Producto | Precio | Cantidad | Subtotal
-    """
+    hoy        = date.today()
+    fecha_from = (hoy - timedelta(days=DESC_DIAS)).strftime('%Y-%m-%d')
+
     lineas_pedido = buscar(models, uid,
         'sale.order.line',
         [
             ['discount', '>', DESC_AMARILLO],
             ['order_id.state', 'in', ['sale', 'done']],
+            ['order_id.date_order', '>=', fecha_from],
         ],
         ['order_id', 'product_id', 'discount', 'price_unit', 'product_uom_qty', 'price_subtotal']
     )
@@ -96,47 +95,65 @@ def get_descuentos(models, uid):
             ['move_id.move_type', '=', 'out_invoice'],
             ['move_id.state', '=', 'posted'],
             ['display_type', '=', 'product'],
+            ['move_id.invoice_date', '>=', fecha_from],
         ],
         ['move_id', 'partner_id', 'product_id', 'discount', 'price_unit', 'quantity', 'price_subtotal']
     )
+
+    # Obtener info de pedidos (cliente, fecha)
+    pedido_ids = list({l['order_id'][0] for l in lineas_pedido if l['order_id']})
+    pedidos_info = {}
+    if pedido_ids:
+        raw = buscar(models, uid, 'sale.order',
+            [['id', 'in', pedido_ids]], ['id', 'partner_id', 'date_order', 'name'])
+        pedidos_info = {p['id']: p for p in raw}
 
     resumen = []
     detalle = []
 
     for l in lineas_pedido:
-        nivel   = '🔴 Rojo' if l['discount'] >= DESC_ROJO else '🟡 Amarillo'
-        cliente = l['order_id'][1].split(' - ')[0] if l['order_id'] else ''
-        pedido  = l['order_id'][1] if l['order_id'] else ''
-        prod    = l['product_id'][1] if l['product_id'] else ''
-        codigo  = prod.split(']')[0].replace('[','').strip() if ']' in prod else ''
-        nombre  = prod.split('] ')[-1] if ']' in prod else prod
+        oid    = l['order_id'][0] if l['order_id'] else None
+        pinfo  = pedidos_info.get(oid, {})
+        cliente= pinfo.get('partner_id', [None,''])[1] if pinfo else ''
+        pedido = pinfo.get('name', '')
+        fecha  = pinfo.get('date_order', '')[:10] if pinfo else ''
+        prod   = l['product_id'][1] if l['product_id'] else ''
+        codigo = prod.split(']')[0].replace('[','').strip() if ']' in prod else ''
+        nombre = prod.split('] ')[-1] if ']' in prod else prod
 
-        resumen.append({'Cliente': cliente, 'N° Pedido': pedido,
-                        'Descuento': l['discount'], 'Nivel': nivel})
+        existe = next((r for r in resumen if r['N° Pedido'] == pedido), None)
+        if not existe:
+            resumen.append({'Cliente': cliente, 'N° Pedido': pedido,
+                            'Fecha': fecha, 'Descuento': l['discount']})
+        elif l['discount'] > existe['Descuento']:
+            existe['Descuento'] = l['discount']
+
         detalle.append({
-            'Origen': 'Pedido', 'Cliente': cliente, 'N° Pedido': pedido,
+            'Tipo': 'Pedido', 'Cliente': cliente, 'N° Pedido': pedido, 'Fecha': fecha,
             'Código': codigo, 'Producto': nombre,
             'Precio Unit': l['price_unit'], 'Descuento %': l['discount'],
             'Cantidad': l['product_uom_qty'], 'Subtotal': l['price_subtotal'],
-            'Nivel': nivel,
         })
 
     for l in lineas_factura:
-        nivel   = '🔴 Rojo' if l['discount'] >= DESC_ROJO else '🟡 Amarillo'
         cliente = l['partner_id'][1] if l['partner_id'] else ''
         factura = l['move_id'][1] if l['move_id'] else ''
         prod    = l['product_id'][1] if l['product_id'] else ''
         codigo  = prod.split(']')[0].replace('[','').strip() if ']' in prod else ''
         nombre  = prod.split('] ')[-1] if ']' in prod else prod
 
-        resumen.append({'Cliente': cliente, 'N° Pedido': factura,
-                        'Descuento': l['discount'], 'Nivel': nivel})
+        existe = next((r for r in resumen if r['N° Pedido'] == factura), None)
+        if not existe:
+            resumen.append({'Cliente': cliente, 'N° Pedido': factura,
+                            'Fecha': '', 'Descuento': l['discount']})
+        elif l['discount'] > existe['Descuento']:
+            existe['Descuento'] = l['discount']
+
         detalle.append({
-            'Origen': 'Factura', 'Cliente': cliente, 'N° Pedido': factura,
+            'Tipo': 'Factura', 'Cliente': cliente, 'N° Pedido': factura, 'Fecha': '',
             'Código': codigo, 'Producto': nombre,
             'Precio Unit': l['price_unit'], 'Descuento %': l['discount'],
             'Cantidad': l['quantity'], 'Subtotal': l['price_subtotal'],
-            'Nivel': nivel,
         })
 
     resumen.sort(key=lambda x: x['Descuento'], reverse=True)
@@ -145,13 +162,9 @@ def get_descuentos(models, uid):
 
 
 # ══════════════════════════════════════════════
-# 2. COBRANZA VENCIDA +30 DÍAS
+# 2. COBRANZA VENCIDA
 # ══════════════════════════════════════════════
 def get_cobranza(models, uid):
-    """
-    Replica vista Odoo: Cliente · Vendedor · Ciudad | A la fecha | 1-30 | Vencido >30 | Total
-    Solo clientes con algo vencido >30 días.
-    """
     hoy = date.today()
 
     facturas = buscar(models, uid,
@@ -198,7 +211,6 @@ def get_cobranza(models, uid):
             'Días Vencido': dias_v, 'Monto Pendiente': monto,
         })
 
-    # Enriquecer ciudad
     if clientes:
         partners = buscar(models, uid, 'res.partner',
             [['id', 'in', list(clientes.keys())]], ['id', 'city'])
@@ -208,54 +220,33 @@ def get_cobranza(models, uid):
 
     resumen = [v for v in clientes.values() if v['Vencido >30'] > 0]
     resumen.sort(key=lambda x: x['Vencido >30'], reverse=True)
-
-    detalle = []
-    for cli in resumen:
-        for fac in cli['facturas']:
-            detalle.append({
-                'Cliente': cli['Cliente'], 'Vendedor': cli['Vendedor'],
-                'Ciudad': cli['Ciudad'], 'Factura': fac['Factura'],
-                'Fecha Venc.': fac['Fecha Venc.'], 'Días Vencido': fac['Días Vencido'],
-                'Monto Pendiente': fac['Monto Pendiente'],
-            })
-
-    return resumen, detalle
+    return resumen
 
 
 # ══════════════════════════════════════════════
 # 3. PEDIDOS ATRASADOS
 # ══════════════════════════════════════════════
 def get_pedidos_atrasados(models, uid):
-    """
-    3 estados de alerta:
-    - En cotización   : draft > 3 días
-    - No pickeado     : confirmado, ningún TN/PICK realizado > 3 días
-    - No en bulto     : TN/PICK realizado pero sin TN/OUT realizado > 3 días
-    """
     hoy = date.today()
-    alertas = []
+    cotizaciones, no_pickeados, no_en_bulto = [], [], []
 
-    # 1. Cotizaciones sin confirmar
-    cotizaciones = buscar(models, uid, 'sale.order',
+    cots = buscar(models, uid, 'sale.order',
         [
             ['state', '=', 'draft'],
             ['date_order', '<', (hoy - timedelta(days=DIAS_COTIZACION)).strftime('%Y-%m-%d %H:%M:%S')],
         ],
         ['name', 'partner_id', 'date_order', 'amount_total', 'user_id']
     )
-    for p in cotizaciones:
+    for p in cots:
         dias = (hoy - datetime.strptime(p['date_order'][:10], '%Y-%m-%d').date()).days
-        alertas.append({
+        cotizaciones.append({
             'N° Pedido': p['name'],
             'Cliente':   p['partner_id'][1] if p['partner_id'] else '',
             'Vendedor':  p['user_id'][1] if p['user_id'] else '',
-            'Estado':    'En cotización',
-            'Umbral':    f'+{DIAS_COTIZACION} días',
+            'Estado':    'Sin confirmar',
             'Días':      dias,
-            'Monto':     p['amount_total'],
         })
 
-    # 2 y 3. Pedidos confirmados → revisar pickings
     confirmados = buscar(models, uid, 'sale.order',
         [
             ['state', '=', 'sale'],
@@ -272,35 +263,34 @@ def get_pedidos_atrasados(models, uid):
             'Cliente':   p['partner_id'][1] if p['partner_id'] else '',
             'Vendedor':  p['user_id'][1] if p['user_id'] else '',
             'Días':      dias,
-            'Monto':     p['amount_total'],
         }
 
         if not picking_ids:
-            alertas.append({**base, 'Estado': 'No pickeado', 'Umbral': f'+{DIAS_SIN_PICK} días'})
+            no_pickeados.append({**base, 'Estado': 'No pickeado'})
             continue
 
         pickings = buscar(models, uid, 'stock.picking',
-            [['id', 'in', picking_ids]],
-            ['name', 'state']
-        )
-
+            [['id', 'in', picking_ids]], ['name', 'state'])
         picks = [pk for pk in pickings if 'PICK' in (pk.get('name') or '')]
         outs  = [pk for pk in pickings if 'OUT'  in (pk.get('name') or '')]
 
-        pick_realizado = any(pk['state'] == 'done' for pk in picks)
-        out_realizado  = any(pk['state'] == 'done' for pk in outs)
+        pick_ok = any(pk['state'] == 'done' for pk in picks)
+        out_ok  = any(pk['state'] == 'done' for pk in outs)
 
-        if not pick_realizado:
-            alertas.append({**base, 'Estado': 'No pickeado', 'Umbral': f'+{DIAS_SIN_PICK} días'})
-        elif not out_realizado and dias >= DIAS_SIN_OUT:
-            alertas.append({**base, 'Estado': 'No en bulto', 'Umbral': f'+{DIAS_SIN_OUT} días'})
+        if not pick_ok:
+            no_pickeados.append({**base, 'Estado': 'No pickeado'})
+        elif not out_ok and dias >= DIAS_SIN_OUT:
+            no_en_bulto.append({**base, 'Estado': 'No en bulto'})
 
-    alertas.sort(key=lambda x: x['Días'], reverse=True)
-    return alertas
+    cotizaciones.sort(key=lambda x: x['Días'], reverse=True)
+    no_pickeados.sort(key=lambda x: x['Días'], reverse=True)
+    no_en_bulto.sort(key=lambda x: x['Días'], reverse=True)
+
+    return cotizaciones + no_pickeados + no_en_bulto
 
 
 # ══════════════════════════════════════════════
-# HELPERS EXCEL
+# EXCEL — DESCUENTOS
 # ══════════════════════════════════════════════
 AZUL    = '1B3A6B'
 BLANCO  = 'FFFFFF'
@@ -308,9 +298,9 @@ ROJO_BG = 'FFEBEE'
 AMA_BG  = 'FFFDE7'
 GRIS_BG = 'F5F5F5'
 
-def _h(cell, bg=AZUL, fg=BLANCO):
-    cell.font      = Font(bold=True, color=fg, name='Arial', size=10)
-    cell.fill      = PatternFill('solid', start_color=bg)
+def _h(cell):
+    cell.font      = Font(bold=True, color=BLANCO, name='Arial', size=10)
+    cell.fill      = PatternFill('solid', start_color=AZUL)
     cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
     cell.border    = Border(bottom=Side(style='thin', color='CCCCCC'),
                             right =Side(style='thin', color='CCCCCC'))
@@ -322,128 +312,141 @@ def _d(cell, bg=BLANCO, bold=False):
     cell.border    = Border(bottom=Side(style='thin', color='E0E0E0'),
                             right =Side(style='thin', color='E0E0E0'))
 
-def _titulo(ws, texto, n_cols):
-    ws.merge_cells(f'A1:{get_column_letter(n_cols)}1')
-    c = ws['A1']
-    c.value     = texto
-    c.font      = Font(bold=True, size=13, color=BLANCO, name='Arial')
-    c.fill      = PatternFill('solid', start_color=AZUL)
-    c.alignment = Alignment(horizontal='center', vertical='center')
-    ws.row_dimensions[1].height = 32
-
-def _autowidth(ws, headers, datos):
-    for i, h in enumerate(headers, 1):
-        w = max(len(str(h)) + 4, max((min(len(str(r.get(h,'')))+2, 45) for r in datos), default=10))
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-def _clp(cell):
-    cell.number_format = '$#,##0;($#,##0);"-"'
-
-def _pct(cell):
-    cell.number_format = '0.0"%"'
-
-
-# ══════════════════════════════════════════════
-# EXCEL 1: DESCUENTOS
-# ══════════════════════════════════════════════
 def excel_descuentos(detalle):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Descuentos"
     ws.sheet_properties.tabColor = "D32F2F"
 
-    headers = ['Origen','Cliente','N° Pedido','Código','Producto',
-               'Precio Unit','Descuento %','Cantidad','Subtotal','Nivel']
-    _titulo(ws, f'DESCUENTOS > {DESC_AMARILLO}%  —  Pedidos confirmados y Facturas', len(headers))
+    headers = ['Tipo','Cliente','N° Pedido','Fecha','Código','Producto',
+               'Precio Unit','Descuento %','Cantidad','Subtotal']
+    n = len(headers)
+
+    # Título
+    ws.merge_cells(f'A1:{get_column_letter(n)}1')
+    c = ws['A1']
+    c.value     = f'DESCUENTOS > {int(DESC_AMARILLO)}% — Últimos {DESC_DIAS} días'
+    c.font      = Font(bold=True, size=13, color=BLANCO, name='Arial')
+    c.fill      = PatternFill('solid', start_color=AZUL)
+    c.alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[1].height = 32
 
     for i, h in enumerate(headers, 1):
         _h(ws.cell(row=2, column=i, value=h))
     ws.row_dimensions[2].height = 24
 
     for ri, row in enumerate(detalle, 3):
-        bg = ROJO_BG if '🔴' in row.get('Nivel','') else AMA_BG
+        bg = ROJO_BG if row.get('Descuento %', 0) >= DESC_ROJO else AMA_BG
         for ci, h in enumerate(headers, 1):
-            c = ws.cell(row=ri, column=ci, value=row.get(h,''))
+            c = ws.cell(row=ri, column=ci, value=row.get(h, ''))
             _d(c, bg)
-            if h in ('Precio Unit','Subtotal'): _clp(c)
-            elif h == 'Descuento %': _pct(c)
+            if h in ('Precio Unit', 'Subtotal'):
+                c.number_format = '$#,##0;($#,##0);"-"'
+            elif h == 'Descuento %':
+                c.number_format = '0.0"%"'
 
     if detalle:
         tr = len(detalle) + 3
-        c = ws.cell(row=tr, column=len(headers), value=f'=SUM(I3:I{tr-1})')
-        _d(c, GRIS_BG, bold=True); _clp(c)
         ws.cell(row=tr, column=1, value='TOTAL').font = Font(bold=True, name='Arial', size=9)
+        c = ws.cell(row=tr, column=10, value=f'=SUM(J3:J{tr-1})')
+        _d(c, GRIS_BG, bold=True)
+        c.number_format = '$#,##0;($#,##0);"-"'
 
-    _autowidth(ws, headers, detalle)
+    for i, h in enumerate(headers, 1):
+        w = max(len(h)+4, max((min(len(str(r.get(h,'')))+2,45) for r in detalle), default=10))
+        ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = 'A3'
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
     return buf.getvalue()
 
 
 # ══════════════════════════════════════════════
-# EXCEL 2: COBRANZA
+# PDF — COBRANZA
 # ══════════════════════════════════════════════
-def excel_cobranza(detalle):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Cobranza"
-    ws.sheet_properties.tabColor = "FF6F00"
+def fmt_clp(v):
+    try: return f"$ {int(v):,}".replace(',','.')
+    except: return str(v)
 
-    headers = ['Cliente','Vendedor','Ciudad','Factura','Fecha Venc.','Días Vencido','Monto Pendiente']
-    _titulo(ws, f'COBRANZA VENCIDA — Facturas con más de {COBR_DIAS} días', len(headers))
+def pdf_cobranza(resumen):
+    buf    = io.BytesIO()
+    doc    = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                               leftMargin=1.5*cm, rightMargin=1.5*cm,
+                               topMargin=1.5*cm, bottomMargin=1.5*cm)
+    AZUL_RL = colors.HexColor('#1B3A6B')
+    ROJO_RL = colors.HexColor('#C62828')
+    styles  = getSampleStyleSheet()
+    hoy_str = date.today().strftime('%d/%m/%Y')
+    elementos = []
 
-    for i, h in enumerate(headers, 1):
-        _h(ws.cell(row=2, column=i, value=h))
-    ws.row_dimensions[2].height = 24
+    # Header
+    header = Table([[f'COBRANZA PENDIENTE COMPLETA — TEMPONOVO    {hoy_str}']],
+                   colWidths=[26*cm])
+    header.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0),(-1,-1), AZUL_RL),
+        ('TEXTCOLOR',     (0,0),(-1,-1), colors.white),
+        ('FONTNAME',      (0,0),(-1,-1), 'Helvetica-Bold'),
+        ('FONTSIZE',      (0,0),(-1,-1), 14),
+        ('ALIGN',         (0,0),(-1,-1), 'CENTER'),
+        ('TOPPADDING',    (0,0),(-1,-1), 14),
+        ('BOTTOMPADDING', (0,0),(-1,-1), 14),
+    ]))
+    elementos.append(header)
+    elementos.append(Spacer(1, 0.5*cm))
 
-    for ri, row in enumerate(detalle, 3):
-        dias = row.get('Días Vencido', 0)
-        bg   = ROJO_BG if dias > 90 else AMA_BG if dias > 60 else BLANCO
-        for ci, h in enumerate(headers, 1):
-            c = ws.cell(row=ri, column=ci, value=row.get(h,''))
-            _d(c, bg)
-            if h == 'Monto Pendiente': _clp(c)
+    # Tabla
+    col_widths = [7*cm, 3.5*cm, 3*cm, 3.5*cm, 3.5*cm, 5.5*cm]
+    data = [['Cliente · Vendedor · Ciudad', 'A la fecha', '1-30 días',
+             'Vencido >30', 'Total', 'Facturas vencidas']]
 
-    if detalle:
-        tr = len(detalle) + 3
-        c = ws.cell(row=tr, column=7, value=f'=SUM(G3:G{tr-1})')
-        _d(c, GRIS_BG, bold=True); _clp(c)
-        ws.cell(row=tr, column=1, value='TOTAL').font = Font(bold=True, name='Arial', size=9)
+    for r in resumen:
+        facs_vencidas = ', '.join(
+            f['Factura'] for f in r['facturas'] if f['Días Vencido'] > 30
+        )
+        data.append([
+            f"{r['Cliente']}\n{r['Vendedor']} · {r['Ciudad']}",
+            fmt_clp(r['A la fecha']) if r['A la fecha'] else '—',
+            fmt_clp(r['1-30'])       if r['1-30']       else '—',
+            fmt_clp(r['Vencido >30']),
+            fmt_clp(r['Total']),
+            facs_vencidas,
+        ])
 
-    _autowidth(ws, headers, detalle)
-    ws.freeze_panes = 'A3'
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-    return buf.getvalue()
+    # Fila total
+    data.append([
+        'TOTAL',
+        fmt_clp(sum(r['A la fecha']  for r in resumen)),
+        fmt_clp(sum(r['1-30']        for r in resumen)),
+        fmt_clp(sum(r['Vencido >30'] for r in resumen)),
+        fmt_clp(sum(r['Total']       for r in resumen)),
+        '',
+    ])
 
-
-# ══════════════════════════════════════════════
-# EXCEL 3: PEDIDOS ATRASADOS
-# ══════════════════════════════════════════════
-def excel_pedidos(alertas):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Pedidos Atrasados"
-    ws.sheet_properties.tabColor = "1565C0"
-
-    headers = ['N° Pedido','Cliente','Vendedor','Estado','Umbral','Días','Monto']
-    _titulo(ws, 'PEDIDOS ATRASADOS POR ETAPA', len(headers))
-
-    for i, h in enumerate(headers, 1):
-        _h(ws.cell(row=2, column=i, value=h))
-    ws.row_dimensions[2].height = 24
-
-    ESTADO_BG = {'En cotización': 'FFF9C4', 'No pickeado': 'FFE0B2', 'No en bulto': 'FFCDD2'}
-
-    for ri, row in enumerate(alertas, 3):
-        bg = ESTADO_BG.get(row.get('Estado',''), BLANCO)
-        for ci, h in enumerate(headers, 1):
-            c = ws.cell(row=ri, column=ci, value=row.get(h,''))
-            _d(c, bg)
-            if h == 'Monto': _clp(c)
-
-    _autowidth(ws, headers, alertas)
-    ws.freeze_panes = 'A3'
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    n = len(data)
+    tabla = Table(data, colWidths=col_widths, repeatRows=1)
+    tabla.setStyle(TableStyle([
+        ('BACKGROUND',    (0,0), (-1,0),   AZUL_RL),
+        ('TEXTCOLOR',     (0,0), (-1,0),   colors.white),
+        ('FONTNAME',      (0,0), (-1,0),   'Helvetica-Bold'),
+        ('FONTSIZE',      (0,0), (-1,-1),  8),
+        ('ALIGN',         (1,0), (-1,-1),  'RIGHT'),
+        ('ALIGN',         (0,0), (0,-1),   'LEFT'),
+        ('VALIGN',        (0,0), (-1,-1),  'MIDDLE'),
+        ('TOPPADDING',    (0,0), (-1,-1),  5),
+        ('BOTTOMPADDING', (0,0), (-1,-1),  5),
+        ('TEXTCOLOR',     (3,1), (3,n-2),  ROJO_RL),
+        ('FONTNAME',      (3,1), (3,n-2),  'Helvetica-Bold'),
+        *[('BACKGROUND',  (0,i), (-1,i),   colors.HexColor('#F5F5F5'))
+          for i in range(2, n-1, 2)],
+        ('BACKGROUND',    (0,n-1),(-1,n-1),colors.HexColor('#E3E8F0')),
+        ('FONTNAME',      (0,n-1),(-1,n-1),'Helvetica-Bold'),
+        ('GRID',          (0,0), (-1,-1),  0.3, colors.HexColor('#CCCCCC')),
+    ]))
+    elementos.append(tabla)
+    doc.build(elementos)
+    buf.seek(0)
     return buf.getvalue()
 
 
@@ -451,39 +454,46 @@ def excel_pedidos(alertas):
 # EMAIL HTML
 # ══════════════════════════════════════════════
 def generar_html(desc_res, cobr_res, pedidos):
-    hoy   = date.today().strftime('%d de %B de %Y').capitalize()
-    total = len(desc_res) + len(cobr_res) + len(pedidos)
-    total_vencido = sum(r['Vencido >30'] for r in cobr_res)
+    hoy = date.today().strftime('%d/%m/%Y')
 
     def fmt(v):
         try: return f"$ {int(v):,}".replace(',','.')
         except: return str(v)
 
-    def tabla_desc(rows, max_r=10):
+    def tabla_desc(rows):
         if not rows:
-            return '<p style="color:#4caf50;font-style:italic;">✅ Sin alertas de descuentos</p>'
-        t = '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
-        t += '<tr>' + ''.join(f'<th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">{h}</th>'
-                               for h in ['Cliente','N° Pedido / Factura','Descuento','Nivel']) + '</tr>'
-        for r in rows[:max_r]:
-            bg = '#FFEBEE' if '🔴' in r['Nivel'] else '#FFFDE7'
+            return '<p style="color:#4caf50;font-style:italic;">✅ Sin descuentos altos en los últimos 3 días</p>'
+        t = '''<table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">Cliente</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">N° Pedido</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Fecha</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Descuento</th>
+        </tr>'''
+        for r in rows:
+            bg = '#FFEBEE' if r['Descuento'] >= DESC_ROJO else '#FFFDE7'
             t += f'''<tr style="background:{bg};">
               <td style="padding:7px 12px;border-bottom:1px solid #eee;">{r["Cliente"]}</td>
               <td style="padding:7px 12px;border-bottom:1px solid #eee;">{r["N° Pedido"]}</td>
+              <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;">{r["Fecha"]}</td>
               <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;font-weight:bold;">{r["Descuento"]:.1f}%</td>
-              <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;">{r["Nivel"]}</td>
             </tr>'''
-        if len(rows) > max_r:
-            t += f'<tr><td colspan="4" style="text-align:center;padding:8px;color:#888;font-style:italic;">... y {len(rows)-max_r} más en el Excel adjunto</td></tr>'
-        return t + '</table>'
+        t += '</table>'
+        t += '<p style="font-size:11px;color:#888;margin-top:6px;">📎 Ver detalle por producto en el Excel adjunto</p>'
+        return t
 
-    def tabla_cobr(rows, max_r=10):
+    def tabla_cobr(rows):
         if not rows:
             return '<p style="color:#4caf50;font-style:italic;">✅ Sin facturas vencidas</p>'
-        t = '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
-        t += '<tr>' + ''.join(f'<th style="background:#1B3A6B;color:#fff;padding:8px 12px;">{h}</th>'
-                               for h in ['Cliente · Vendedor · Ciudad','A la fecha','1-30 días','Vencido &gt;30','Total']) + '</tr>'
-        for r in rows[:max_r]:
+        t = '''<table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">Cliente · Vendedor · Ciudad</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:right;">A la fecha</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:right;">1-30 días</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:right;">Vencido &gt;30</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:right;">Total</th>
+        </tr>'''
+        for r in rows:
             info = f"<strong>{r['Cliente']}</strong><br><small style='color:#888;'>{r['Vendedor']} · {r['Ciudad']}</small>"
             t += f'''<tr>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;">{info}</td>
@@ -492,80 +502,76 @@ def generar_html(desc_res, cobr_res, pedidos):
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;font-weight:bold;color:#c62828;">{fmt(r["Vencido >30"])}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;font-weight:bold;">{fmt(r["Total"])}</td>
             </tr>'''
-        if len(rows) > max_r:
-            t += f'<tr><td colspan="5" style="text-align:center;padding:8px;color:#888;font-style:italic;">... y {len(rows)-max_r} clientes más en el Excel adjunto</td></tr>'
-        return t + '</table>'
+        t += f'''<tr style="background:#f0f4f8;">
+          <td style="padding:8px 12px;font-weight:bold;border-top:2px solid #ddd;">TOTAL</td>
+          <td style="padding:8px 12px;text-align:right;font-weight:bold;border-top:2px solid #ddd;">{fmt(sum(r["A la fecha"] for r in rows))}</td>
+          <td style="padding:8px 12px;text-align:right;font-weight:bold;border-top:2px solid #ddd;">{fmt(sum(r["1-30"] for r in rows))}</td>
+          <td style="padding:8px 12px;text-align:right;font-weight:bold;color:#c62828;border-top:2px solid #ddd;">{fmt(sum(r["Vencido >30"] for r in rows))}</td>
+          <td style="padding:8px 12px;text-align:right;font-weight:bold;border-top:2px solid #ddd;">{fmt(sum(r["Total"] for r in rows))}</td>
+        </tr>'''
+        t += '</table>'
+        t += '<p style="font-size:11px;color:#888;margin-top:6px;">📎 Ver detalle completo en el PDF adjunto</p>'
+        return t
 
-    def tabla_ped(rows, max_r=10):
+    ESTADO_BG    = {'Sin confirmar': '#F5F5F5', 'No pickeado': '#F5F5F5', 'No en bulto': '#F5F5F5'}
+    ESTADO_COLOR = {'Sin confirmar': '#1B3A6B', 'No pickeado': '#1B3A6B', 'No en bulto': '#1B3A6B'}
+    ESTADO_ICON  = {'Sin confirmar': '📋', 'No pickeado': '📦', 'No en bulto': '🚚'}
+
+    def tabla_ped(rows):
         if not rows:
             return '<p style="color:#4caf50;font-style:italic;">✅ Sin pedidos atrasados</p>'
-        ESTADO_BG = {'En cotización':'#FFF9C4','No pickeado':'#FFE0B2','No en bulto':'#FFCDD2'}
-        t = '<table style="width:100%;border-collapse:collapse;font-size:12px;">'
-        t += '<tr>' + ''.join(f'<th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">{h}</th>'
-                               for h in ['N° Pedido','Cliente','Estado','Umbral','Días']) + '</tr>'
-        for r in rows[:max_r]:
-            bg = ESTADO_BG.get(r['Estado'],'#fff')
+        t = '''<table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">N° Pedido</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">Cliente</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">Vendedor</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Estado</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Días</th>
+        </tr>'''
+        estado_actual = None
+        for r in rows:
+            if r['Estado'] != estado_actual:
+                estado_actual = r['Estado']
+                color = ESTADO_COLOR.get(estado_actual, '#555')
+                icon  = ESTADO_ICON.get(estado_actual, '')
+                t += f'<tr><td colspan="5" style="background:{color};color:#fff;padding:6px 12px;font-weight:bold;font-size:11px;">{icon} {estado_actual.upper()}</td></tr>'
+            bg = ESTADO_BG.get(r['Estado'], '#fff')
             t += f'''<tr style="background:{bg};">
               <td style="padding:7px 12px;border-bottom:1px solid #eee;font-weight:bold;">{r["N° Pedido"]}</td>
               <td style="padding:7px 12px;border-bottom:1px solid #eee;">{r["Cliente"]}</td>
-              <td style="padding:7px 12px;border-bottom:1px solid #eee;">{r["Estado"]}</td>
-              <td style="padding:7px 12px;border-bottom:1px solid #eee;color:#888;">{r["Umbral"]}</td>
+              <td style="padding:7px 12px;border-bottom:1px solid #eee;color:#666;">{r["Vendedor"]}</td>
+              <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;">{r["Estado"]}</td>
               <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;font-weight:bold;">{r["Días"]}d</td>
             </tr>'''
-        if len(rows) > max_r:
-            t += f'<tr><td colspan="5" style="text-align:center;padding:8px;color:#888;font-style:italic;">... y {len(rows)-max_r} más en el Excel adjunto</td></tr>'
         return t + '</table>'
 
-    def seccion(emoji, titulo, n, color, tabla_html):
-        return f'''
-        <div style="margin-bottom:32px;">
-          <h3 style="margin:0 0 12px;color:#1B3A6B;font-size:15px;
-                     border-left:4px solid {color};padding-left:12px;">
+    def seccion(emoji, titulo, n, color, contenido):
+        return f'''<div style="margin-bottom:32px;">
+          <h3 style="margin:0 0 12px;color:#1B3A6B;font-size:15px;border-left:4px solid {color};padding-left:12px;">
             {emoji} {titulo}
-            <span style="margin-left:10px;background:{color};color:#fff;
-                         padding:2px 10px;border-radius:12px;font-size:12px;">{n}</span>
+            <span style="margin-left:8px;background:{color};color:#fff;padding:2px 9px;border-radius:12px;font-size:12px;">{n}</span>
           </h3>
-          {tabla_html}
+          {contenido}
         </div>'''
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="font-family:Arial,sans-serif;background:#f0f2f5;margin:0;padding:24px;">
-<div style="max-width:820px;margin:auto;background:#fff;border-radius:10px;
-            overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+<div style="max-width:820px;margin:auto;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
 
   <div style="background:#1B3A6B;padding:28px 32px;">
-    <h1 style="color:#fff;margin:0;font-size:22px;">⚠️ Reporte de Alertas — Temponovo</h1>
-    <p style="color:#8eadd4;margin:6px 0 0;font-size:13px;">{hoy} · Envío automático Lunes y Jueves</p>
-  </div>
-
-  <div style="background:#f8f9fb;padding:20px 32px;border-bottom:1px solid #e8eaed;">
-    <div style="display:flex;gap:16px;flex-wrap:wrap;">
-      {"".join(f'''<div style="background:#fff;border:1px solid #e0e0e0;border-radius:8px;
-                  padding:16px 22px;text-align:center;min-width:110px;">
-        <div style="font-size:26px;font-weight:bold;color:{vc};">{vv}</div>
-        <div style="font-size:11px;color:#888;margin-top:2px;">{vl}</div>
-      </div>''' for vv, vc, vl in [
-          (total, '#c62828' if total>0 else '#388e3c', 'Total alertas'),
-          (len(desc_res), '#D32F2F', 'Descuentos altos'),
-          (len(cobr_res), '#E65100', 'Clientes vencidos'),
-          (fmt(total_vencido), '#c62828', 'Total vencido &gt;30d'),
-          (len(pedidos), '#1565C0', 'Pedidos atrasados'),
-      ])}
-    </div>
+    <h1 style="color:#fff;margin:0;font-size:22px;">Reporte Temponovo</h1>
+    <p style="color:#8eadd4;margin:6px 0 0;font-size:13px;">{hoy}</p>
   </div>
 
   <div style="padding:28px 32px;">
-    {seccion('🏷️','Descuentos superiores al 30%', len(desc_res), '#D32F2F', tabla_desc(desc_res))}
-    {seccion('💸','Cobranza vencida', len(cobr_res), '#E65100', tabla_cobr(cobr_res))}
-    {seccion('📦','Pedidos atrasados por etapa', len(pedidos), '#1565C0', tabla_ped(pedidos))}
+    {seccion('🏷️', f'Descuentos superiores al {int(DESC_AMARILLO)}%', len(desc_res), '#D32F2F', tabla_desc(desc_res))}
+    {seccion('💸', 'Cobranza vencida', len(cobr_res), '#E65100', tabla_cobr(cobr_res))}
+    {seccion('📦', 'Pedidos atrasados', len(pedidos), '#1565C0', tabla_ped(pedidos))}
   </div>
 
-  <div style="background:#f8f9fb;padding:16px 32px;border-top:1px solid #e8eaed;text-align:center;">
-    <p style="margin:0;font-size:11px;color:#aaa;">
-      Reporte automático · Temponovo · Datos extraídos de Odoo ERP<br>
-      Se adjuntan 3 archivos Excel con el detalle completo
-    </p>
+  <div style="background:#f8f9fb;padding:14px 32px;border-top:1px solid #e8eaed;text-align:center;">
+    <p style="margin:0;font-size:11px;color:#aaa;">Reporte automático · Temponovo · Odoo ERP</p>
   </div>
 </div>
 </body></html>"""
@@ -574,64 +580,64 @@ def generar_html(desc_res, cobr_res, pedidos):
 # ══════════════════════════════════════════════
 # ENVÍO EMAIL
 # ══════════════════════════════════════════════
-def enviar_email(html, excel_desc, excel_cobr, excel_ped, desc_res, cobr_res, pedidos):
+def enviar_email(html, excel_desc_bytes, pdf_cobr_bytes):
     fecha_str = date.today().strftime('%Y%m%d')
-    total     = len(desc_res) + len(cobr_res) + len(pedidos)
 
     msg = MIMEMultipart('mixed')
     msg['From']    = SMTP_USER
     msg['To']      = ', '.join(DESTINATARIOS)
-    msg['Subject'] = (
-        f"⚠️ Alertas Temponovo — {date.today().strftime('%d/%m/%Y')} "
-        f"[{len(desc_res)} desc · {len(cobr_res)} cobr · {len(pedidos)} ped]"
-    )
+    msg['Subject'] = f"Reporte Temponovo — {date.today().strftime('%d/%m/%Y')}"
     msg.attach(MIMEText(html, 'html', 'utf-8'))
 
-    for datos, nombre in [
-        (excel_desc, f"descuentos_{fecha_str}.xlsx"),
-        (excel_cobr, f"cobranza_{fecha_str}.xlsx"),
-        (excel_ped,  f"pedidos_atrasados_{fecha_str}.xlsx"),
-    ]:
-        part = MIMEBase('application', 'vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        part.set_payload(datos)
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename="{nombre}"')
-        msg.attach(part)
+    part_xlsx = MIMEBase('application', 'vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    part_xlsx.set_payload(excel_desc_bytes)
+    encoders.encode_base64(part_xlsx)
+    part_xlsx.add_header('Content-Disposition', f'attachment; filename="descuentos_{fecha_str}.xlsx"')
+    msg.attach(part_xlsx)
+
+    part_pdf = MIMEBase('application', 'pdf')
+    part_pdf.set_payload(pdf_cobr_bytes)
+    encoders.encode_base64(part_pdf)
+    part_pdf.add_header('Content-Disposition', f'attachment; filename="cobranza_{fecha_str}.pdf"')
+    msg.attach(part_pdf)
 
     ctx = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
-        srv.ehlo(); srv.starttls(context=ctx)
+        srv.ehlo()
+        srv.starttls(context=ctx)
         srv.login(SMTP_USER, SMTP_PASSWORD)
         srv.sendmail(SMTP_USER, DESTINATARIOS, msg.as_bytes())
 
-    print(f"✅ Enviado — {total} alertas ({len(desc_res)} desc · {len(cobr_res)} cobr · {len(pedidos)} ped)")
+    print(f"✅ Email enviado")
 
 
 # ══════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════
 def main():
-    print(f"\n🚀 Reporte alertas Temponovo — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    print(f"\n🚀 Reporte Temponovo — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     uid, models = conectar_odoo()
     print("✅ Conectado a Odoo")
 
     print("  🏷️  Descuentos...")
     desc_res, desc_det = get_descuentos(models, uid)
+    print(f"     {len(desc_res)} pedidos/facturas con descuento alto")
 
     print("  💸 Cobranza...")
-    cobr_res, cobr_det = get_cobranza(models, uid)
+    cobr_res, cobr_todos = get_cobranza(models, uid)
+    print(f"     {len(cobr_res)} clientes con deuda vencida >30d")
 
     print("  📦 Pedidos atrasados...")
     pedidos = get_pedidos_atrasados(models, uid)
+    print(f"     {len(pedidos)} pedidos atrasados")
 
-    print("  📄 Generando Excel...")
-    e_desc = excel_descuentos(desc_det)
-    e_cobr = excel_cobranza(cobr_det)
-    e_ped  = excel_pedidos(pedidos)
+    print("  📄 Generando adjuntos...")
+    excel_desc = excel_descuentos(desc_det)
+    pdf_cobr   = pdf_cobranza(cobr_todos)
 
     print("  📧 Enviando email...")
     html = generar_html(desc_res, cobr_res, pedidos)
-    enviar_email(html, e_desc, e_cobr, e_ped, desc_res, cobr_res, pedidos)
+    enviar_email(html, excel_desc, pdf_cobr)
 
     print("✅ Proceso completado\n")
 

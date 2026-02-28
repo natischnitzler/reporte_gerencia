@@ -218,9 +218,15 @@ def get_cobranza(models, uid):
             if p['id'] in clientes:
                 clientes[p['id']]['Ciudad'] = p.get('city') or ''
 
+    # Email: solo clientes con vencido >30
     resumen = [v for v in clientes.values() if v['Vencido >30'] > 0]
     resumen.sort(key=lambda x: x['Vencido >30'], reverse=True)
-    return resumen
+
+    # PDF: todos los clientes con deuda pendiente
+    todos = list(clientes.values())
+    todos.sort(key=lambda x: x['Total'], reverse=True)
+
+    return resumen, todos
 
 
 # ══════════════════════════════════════════════

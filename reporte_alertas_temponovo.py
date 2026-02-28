@@ -36,10 +36,16 @@ SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER     = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
-DESTINATARIOS = [
+# TEST_MODE = True  → manda solo a TEST_EMAIL para probar
+# TEST_MODE = False → manda a todos (producción)
+TEST_MODE  = os.environ.get("TEST_MODE", "false").lower() == "true"
+TEST_EMAIL = os.environ.get("TEST_EMAIL", "natalia@temponovo.cl")
+
+DESTINATARIOS_PROD = [
     "daniel@temponovo.cl",
     "natalia@temponovo.cl",
 ]
+DESTINATARIOS = [TEST_EMAIL] if TEST_MODE else DESTINATARIOS_PROD
 
 # ── Umbrales ──
 DESC_AMARILLO   = 30.0
@@ -72,35 +78,58 @@ def buscar(models, uid, modelo, dominio, campos, limite=1000):
 
 
 # ══════════════════════════════════════════════
-# 1. DESCUENTOS > 30% — últimos 3 días
+# 1. DESCUENTOS — calculado desde list_price
 # ══════════════════════════════════════════════
+def calc_descuento(precio_vendido, list_price):
+    """Descuento real = (list_price - vendido) / list_price * 100"""
+    if not list_price or list_price <= 0:
+        return 0.0
+    return max(0.0, (list_price - precio_vendido) / list_price * 100)
+
 def get_descuentos(models, uid):
     hoy        = date.today()
     fecha_from = (hoy - timedelta(days=DESC_DIAS)).strftime('%Y-%m-%d')
 
+    # Pedidos confirmados últimos 3 días (sin filtro de discount, calculamos nosotros)
     lineas_pedido = buscar(models, uid,
         'sale.order.line',
         [
-            ['discount', '>', DESC_AMARILLO],
             ['order_id.state', 'in', ['sale', 'done']],
             ['order_id.date_order', '>=', fecha_from],
+            ['product_id', '!=', False],
         ],
-        ['order_id', 'product_id', 'discount', 'price_unit', 'product_uom_qty', 'price_subtotal']
+        ['order_id', 'product_id', 'price_unit', 'product_uom_qty', 'price_subtotal']
     )
 
+    # Facturas últimos 3 días
     lineas_factura = buscar(models, uid,
         'account.move.line',
         [
-            ['discount', '>', DESC_AMARILLO],
             ['move_id.move_type', '=', 'out_invoice'],
             ['move_id.state', '=', 'posted'],
             ['display_type', '=', 'product'],
             ['move_id.invoice_date', '>=', fecha_from],
+            ['product_id', '!=', False],
         ],
-        ['move_id', 'partner_id', 'product_id', 'discount', 'price_unit', 'quantity', 'price_subtotal']
+        ['move_id', 'partner_id', 'product_id', 'price_unit', 'quantity', 'price_subtotal']
     )
 
-    # Obtener info de pedidos (cliente, fecha)
+    # Obtener list_price de todos los productos involucrados
+    prod_ids = set()
+    for l in lineas_pedido:
+        if l['product_id']: prod_ids.add(l['product_id'][0])
+    for l in lineas_factura:
+        if l['product_id']: prod_ids.add(l['product_id'][0])
+
+    list_prices = {}
+    if prod_ids:
+        prods = buscar(models, uid, 'product.product',
+            [['id', 'in', list(prod_ids)]],
+            ['id', 'list_price']
+        )
+        list_prices = {p['id']: p['list_price'] for p in prods}
+
+    # Info de pedidos (cliente, fecha, nombre)
     pedido_ids = list({l['order_id'][0] for l in lineas_pedido if l['order_id']})
     pedidos_info = {}
     if pedido_ids:
@@ -108,55 +137,76 @@ def get_descuentos(models, uid):
             [['id', 'in', pedido_ids]], ['id', 'partner_id', 'date_order', 'name'])
         pedidos_info = {p['id']: p for p in raw}
 
-    resumen = []
+    # resumen email: una fila por CLIENTE (descuento máximo)
+    # detalle excel: una fila por producto
+    resumen_clientes = {}  # cliente -> {desc_max, pedidos}
     detalle = []
 
     for l in lineas_pedido:
-        oid    = l['order_id'][0] if l['order_id'] else None
-        pinfo  = pedidos_info.get(oid, {})
-        cliente= pinfo.get('partner_id', [None,''])[1] if pinfo else ''
-        pedido = pinfo.get('name', '')
-        fecha  = pinfo.get('date_order', '')[:10] if pinfo else ''
-        prod   = l['product_id'][1] if l['product_id'] else ''
-        codigo = prod.split(']')[0].replace('[','').strip() if ']' in prod else ''
-        nombre = prod.split('] ')[-1] if ']' in prod else prod
+        oid      = l['order_id'][0] if l['order_id'] else None
+        pinfo    = pedidos_info.get(oid, {})
+        cliente  = pinfo.get('partner_id', [None,''])[1] if pinfo else ''
+        pedido   = pinfo.get('name', '')
+        fecha    = pinfo.get('date_order', '')[:10] if pinfo else ''
+        pid      = l['product_id'][0] if l['product_id'] else None
+        prod_str = l['product_id'][1] if l['product_id'] else ''
+        codigo   = prod_str.split(']')[0].replace('[','').strip() if ']' in prod_str else ''
+        nombre   = prod_str.split('] ')[-1] if ']' in prod_str else prod_str
+        lp       = list_prices.get(pid, 0)
+        desc     = calc_descuento(l['price_unit'], lp)
 
-        existe = next((r for r in resumen if r['N° Pedido'] == pedido), None)
-        if not existe:
-            resumen.append({'Cliente': cliente, 'N° Pedido': pedido,
-                            'Fecha': fecha, 'Descuento': l['discount']})
-        elif l['discount'] > existe['Descuento']:
-            existe['Descuento'] = l['discount']
+        if desc < DESC_AMARILLO:
+            continue
+
+        # Resumen por cliente
+        if cliente not in resumen_clientes:
+            resumen_clientes[cliente] = {'Cliente': cliente, 'Descuento': desc,
+                                          'Pedidos': pedido, 'Fecha': fecha}
+        else:
+            if desc > resumen_clientes[cliente]['Descuento']:
+                resumen_clientes[cliente]['Descuento'] = desc
+            if pedido not in resumen_clientes[cliente]['Pedidos']:
+                resumen_clientes[cliente]['Pedidos'] += f', {pedido}'
 
         detalle.append({
             'Tipo': 'Pedido', 'Cliente': cliente, 'N° Pedido': pedido, 'Fecha': fecha,
             'Código': codigo, 'Producto': nombre,
-            'Precio Unit': l['price_unit'], 'Descuento %': l['discount'],
+            'Precio Lista': lp, 'Precio Vendido': l['price_unit'],
+            'Descuento %': round(desc, 1),
             'Cantidad': l['product_uom_qty'], 'Subtotal': l['price_subtotal'],
         })
 
     for l in lineas_factura:
-        cliente = l['partner_id'][1] if l['partner_id'] else ''
-        factura = l['move_id'][1] if l['move_id'] else ''
-        prod    = l['product_id'][1] if l['product_id'] else ''
-        codigo  = prod.split(']')[0].replace('[','').strip() if ']' in prod else ''
-        nombre  = prod.split('] ')[-1] if ']' in prod else prod
+        cliente  = l['partner_id'][1] if l['partner_id'] else ''
+        factura  = l['move_id'][1] if l['move_id'] else ''
+        pid      = l['product_id'][0] if l['product_id'] else None
+        prod_str = l['product_id'][1] if l['product_id'] else ''
+        codigo   = prod_str.split(']')[0].replace('[','').strip() if ']' in prod_str else ''
+        nombre   = prod_str.split('] ')[-1] if ']' in prod_str else prod_str
+        lp       = list_prices.get(pid, 0)
+        desc     = calc_descuento(l['price_unit'], lp)
 
-        existe = next((r for r in resumen if r['N° Pedido'] == factura), None)
-        if not existe:
-            resumen.append({'Cliente': cliente, 'N° Pedido': factura,
-                            'Fecha': '', 'Descuento': l['discount']})
-        elif l['discount'] > existe['Descuento']:
-            existe['Descuento'] = l['discount']
+        if desc < DESC_AMARILLO:
+            continue
+
+        if cliente not in resumen_clientes:
+            resumen_clientes[cliente] = {'Cliente': cliente, 'Descuento': desc,
+                                          'Pedidos': factura, 'Fecha': ''}
+        else:
+            if desc > resumen_clientes[cliente]['Descuento']:
+                resumen_clientes[cliente]['Descuento'] = desc
+            if factura not in resumen_clientes[cliente]['Pedidos']:
+                resumen_clientes[cliente]['Pedidos'] += f', {factura}'
 
         detalle.append({
             'Tipo': 'Factura', 'Cliente': cliente, 'N° Pedido': factura, 'Fecha': '',
             'Código': codigo, 'Producto': nombre,
-            'Precio Unit': l['price_unit'], 'Descuento %': l['discount'],
+            'Precio Lista': lp, 'Precio Vendido': l['price_unit'],
+            'Descuento %': round(desc, 1),
             'Cantidad': l['quantity'], 'Subtotal': l['price_subtotal'],
         })
 
-    resumen.sort(key=lambda x: x['Descuento'], reverse=True)
+    resumen = sorted(resumen_clientes.values(), key=lambda x: x['Descuento'], reverse=True)
     detalle.sort(key=lambda x: x['Descuento %'], reverse=True)
     return resumen, detalle
 
@@ -325,7 +375,7 @@ def excel_descuentos(detalle):
     ws.sheet_properties.tabColor = "D32F2F"
 
     headers = ['Tipo','Cliente','N° Pedido','Fecha','Código','Producto',
-               'Precio Unit','Descuento %','Cantidad','Subtotal']
+               'Precio Lista','Precio Vendido','Descuento %','Cantidad','Subtotal']
     n = len(headers)
 
     # Título
@@ -354,7 +404,7 @@ def excel_descuentos(detalle):
     if detalle:
         tr = len(detalle) + 3
         ws.cell(row=tr, column=1, value='TOTAL').font = Font(bold=True, name='Arial', size=9)
-        c = ws.cell(row=tr, column=10, value=f'=SUM(J3:J{tr-1})')
+        c = ws.cell(row=tr, column=11, value=f'=SUM(K3:K{tr-1})')
         _d(c, GRIS_BG, bold=True)
         c.number_format = '$#,##0;($#,##0);"-"'
 
@@ -472,16 +522,14 @@ def generar_html(desc_res, cobr_res, pedidos):
         t = '''<table style="width:100%;border-collapse:collapse;font-size:12px;">
         <tr>
           <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">Cliente</th>
-          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">N° Pedido</th>
-          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Fecha</th>
-          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Descuento</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:left;">Pedido(s)</th>
+          <th style="background:#1B3A6B;color:#fff;padding:8px 12px;text-align:center;">Desc. máx.</th>
         </tr>'''
         for r in rows:
             bg = '#FFEBEE' if r['Descuento'] >= DESC_ROJO else '#FFFDE7'
             t += f'''<tr style="background:{bg};">
-              <td style="padding:7px 12px;border-bottom:1px solid #eee;">{r["Cliente"]}</td>
-              <td style="padding:7px 12px;border-bottom:1px solid #eee;">{r["N° Pedido"]}</td>
-              <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;">{r["Fecha"]}</td>
+              <td style="padding:7px 12px;border-bottom:1px solid #eee;font-weight:bold;">{r["Cliente"]}</td>
+              <td style="padding:7px 12px;border-bottom:1px solid #eee;color:#555;">{r["Pedidos"]}</td>
               <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:center;font-weight:bold;">{r["Descuento"]:.1f}%</td>
             </tr>'''
         t += '</table>'

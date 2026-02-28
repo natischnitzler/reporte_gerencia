@@ -4,7 +4,16 @@ on:
   schedule:
     - cron: '0 11 * * 1'   # Lunes 8:00 AM Chile
     - cron: '0 11 * * 4'   # Jueves 8:00 AM Chile
-  workflow_dispatch:        # Permite ejecutar manualmente para probar
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Modo prueba (manda solo a TEST_EMAIL)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   enviar-reporte:
@@ -29,4 +38,6 @@ jobs:
           ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
           SMTP_USER:     ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          TEST_EMAIL:    ${{ secrets.TEST_EMAIL }}
+          TEST_MODE:     ${{ github.event.inputs.test_mode || 'false' }}
         run: python reporte_alertas_temponovo.py

@@ -39,7 +39,7 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 # TEST_MODE = True  → manda solo a TEST_EMAIL para probar
 # TEST_MODE = False → manda a todos (producción)
 TEST_MODE  = os.environ.get("TEST_MODE", "false").lower() == "true"
-TEST_EMAIL = os.environ.get("TEST_EMAIL", "natalia@temponovo.cl")
+TEST_EMAIL = "natalia@temponovo.cl"
 
 DESTINATARIOS_PROD = [
     "daniel@temponovo.cl",
